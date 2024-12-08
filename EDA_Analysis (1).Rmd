@@ -1,0 +1,364 @@
+---
+title: "Environmental Data Extraction and Analysis"
+author: "Khairul Islam, Austin Tarrach"
+date: "2024-12-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load libraries
+library(dplyr)
+library(ggplot2)
+library(leaflet)
+library(ggcorrplot)
+library(corrr)
+library(lubridate)
+library(geosphere)
+library(car)
+```
+
+
+# Merge the Datasets by tripid
+```{r}
+raw_locations <- read.csv("raw_locations_env2.csv")
+
+trip_data <- read.csv("tripData.csv")
+
+organized_data <- raw_locations %>%
+  inner_join(trip_data, by = "tripid")
+
+organized_data <- organized_data %>%
+  arrange(tripid)
+
+write.csv(organized_data, "organized_trip_data.csv", row.names = FALSE)
+```
+
+# Load the full trip dataset
+```{r}
+full_data <- read.csv("organized_trip_data.csv")
+
+# Remove specific columns
+full_data <- full_data %>%
+  select(-X.x, -accuracy, -GEE_datetime, -X.y, -activityid, -activityprobability)
+
+full_data <- full_data %>%
+  rename(aerosol_index = air_quality)
+
+write.csv(full_data, "organized_trip_data.csv", row.names = FALSE)
+```
+
+# Calculate Duration and Distance
+```{r}
+full_data <- read.csv("organized_trip_data.csv")
+
+full_data <- full_data %>%
+  mutate(
+    startlongitude = as.numeric(startlongitude),
+    startlatitude = as.numeric(startlatitude),
+    endlongitude = as.numeric(endlongitude),
+    endlatitude = as.numeric(endlatitude)
+  )
+
+full_data <- full_data %>%
+  mutate(
+    duration_start = ymd_hms(durationstart),
+    duration_end = ymd_hms(durationend),
+    duration_minutes = as.numeric(difftime(duration_end, duration_start, units = "mins"))
+  )
+
+full_data <- full_data %>%
+  mutate(
+    distance_km = distHaversine(
+      cbind(startlongitude, startlatitude),
+      cbind(endlongitude, endlatitude)
+    ) / 1000 # Convert meters to kilometers
+  )
+
+```
+
+# Aggregate and Organize Data
+```{r}
+aggregated_data <- full_data %>%
+  group_by(tripid) %>% # Replace with `destination` or other grouping if needed
+  summarize(
+    trip_count = n(), # Count trips
+    avg_temp_c = mean(temp_celsius, na.rm = TRUE),
+    avg_wind_speed_mph = mean(wind_speed_mph, na.rm = TRUE),
+    avg_aerosol_index = mean(aerosol_index, na.rm = TRUE),
+    trip_duration_mins = mean(duration_minutes, na.rm = TRUE),
+    trip_distance_km = mean(distance_km, na.rm = TRUE)
+  )
+
+write.csv(aggregated_data, "aggregated_data.csv", row.names = FALSE)
+
+```
+
+# Exploratory Data Analysis
+```{r}
+aggregated_data <- read.csv("aggregated_data.csv")
+
+# Example: Distance vs Trip Count
+ggplot(aggregated_data, aes(x = trip_distance_km, y = trip_count)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(title = "Distance vs Trip Count", x = "Distance (km)", y = "Trip Count")
+
+# Example: Duration vs Trip Count
+ggplot(aggregated_data, aes(x = trip_duration_mins, y = trip_count)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(title = "Duration vs Trip Count", x = "Duration (minutes)", y = "Trip Count")
+
+# Distance vs Avg Temp
+ggplot(aggregated_data, aes(x = trip_distance_km, y = avg_temp_c)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(title = "Distance vs Avg Temperature", x = "Distance (km)", y = "Avg Temperature (°C)")
+
+# Duration vs Avg Temp
+ggplot(aggregated_data, aes(x = trip_duration_mins, y = avg_temp_c)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(title = "Duration vs Avg Temperature", x = "Duration (minutes)", y = "Avg Temperature (°C)")
+
+ggplot(aggregated_data, aes(x = trip_distance_km, y = avg_wind_speed_mph)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(
+    title = "Distance vs Avg Wind Speed",
+    x = "Distance (km)",
+    y = "Avg Wind Speed (mph)"
+  )
+
+ggplot(aggregated_data, aes(x = trip_duration_mins, y = avg_wind_speed_mph)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(
+    title = "Duration vs Avg Wind Speed",
+    x = "Duration (minutes)",
+    y = "Avg Wind Speed (mph)"
+  )
+
+
+```
+
+# EDA 2
+```{r}
+aggregated_data <- read.csv("aggregated_data.csv")
+
+correlations <- aggregated_data %>% select(trip_count, avg_temp_c, avg_wind_speed_mph, avg_aerosol_index, trip_distance_km, trip_duration_mins) %>% correlate()
+print(correlations)
+
+aggregated_data <- aggregated_data %>%
+  mutate(
+    region = case_when(
+      trip_distance_km < 50 ~ "Local",
+      trip_distance_km >= 50 & trip_distance_km < 200 ~ "Regional",
+      trip_distance_km >= 200 ~ "Long Distance"
+    )
+  )
+
+ggplot(aggregated_data, aes(x = trip_count, y = avg_temp_c, color = region)) +
+  geom_point() +
+  labs(title = "Trip Count vs Temperature by Region")
+
+library(ggcorrplot)
+ggcorrplot(cor(aggregated_data %>% select(trip_duration_mins, avg_temp_c, avg_wind_speed_mph, avg_aerosol_index)))
+
+
+```
+
+```{r}
+library(ggplot2)
+
+# Variables to visualize
+variables <- c("avg_temp_c", "avg_wind_speed_mph", "avg_aerosol_index", "trip_count", "trip_duration_mins", "trip_distance_km")
+
+# Loop to create and save histograms
+for (var in variables) {
+  plot <- ggplot(aggregated_data, aes(x = .data[[var]])) + # Use tidy evaluation
+    geom_histogram(binwidth = 10, fill = "steelblue", color = "black", alpha = 0.7) +
+    labs(title = paste("Distribution of", var), x = var, y = "Frequency") +
+    theme_minimal()
+  print(plot)
+}
+```
+```{r}
+for (var in variables) {
+  binwidth <- diff(range(aggregated_data[[var]], na.rm = TRUE)) / 30 # 30 bins
+  plot <- ggplot(aggregated_data, aes(x = .data[[var]])) +
+    geom_histogram(binwidth = binwidth, fill = "steelblue", color = "black", alpha = 0.7) +
+    labs(title = paste("Distribution of", var), x = var, y = "Frequency") +
+    theme_minimal()
+  print(plot)
+}
+
+```
+```{r}
+library(ggplot2)
+
+# Variables to visualize
+variables <- c("avg_temp_c", "avg_wind_speed_mph", "avg_aerosol_index", "trip_count", "trip_duration_mins", "trip_distance_km")
+
+# Loop to create and display density plots
+for (var in variables) {
+  plot <- ggplot(aggregated_data, aes(x = .data[[var]])) + # Use tidy evaluation
+    geom_density(fill = "lightgreen", alpha = 0.5) +
+    labs(
+      title = paste("Density Plot of", var),
+      x = var,
+      y = "Density"
+    ) +
+    theme_minimal()
+  print(plot) # Display the plot
+}
+
+```
+
+```{r}
+library(tidyr)
+library(ggplot2)
+
+# Reshape data to long format
+data_long <- aggregated_data %>%
+  pivot_longer(
+    cols = c(avg_temp_c, avg_wind_speed_mph, avg_aerosol_index, trip_count, trip_duration_mins, trip_distance_km),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+# Faceted histogram
+ggplot(data_long, aes(x = value)) +
+  geom_histogram(fill = "skyblue", color = "black", alpha = 0.7, bins = 30) +
+  facet_wrap(~variable, scales = "free") + # Facet by variable, free scales for different ranges
+  labs(
+    title = "Distribution of Variables",
+    x = "Value",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+# Faceted density plot
+ggplot(data_long, aes(x = value, fill = variable)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~variable, scales = "free") + # Facet by variable, free scales for different ranges
+  labs(
+    title = "Density Plots of Variables",
+    x = "Value",
+    y = "Density"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none") # Hide legend for clarity
+
+```
+```{r}
+# Handle Missing Values
+data_clean <- aggregated_data %>%
+  drop_na(trip_count, avg_temp_c, avg_wind_speed_mph, trip_duration_mins, trip_distance_km)
+
+# Check Multicollinearity
+model <- lm(trip_count ~ avg_temp_c + avg_wind_speed_mph + trip_duration_mins + trip_distance_km, data = data_clean)
+temp_model <- lm(trip_count ~ avg_temp_c + avg_wind_speed_mph, data = data_clean);
+vif(model)
+vif(temp_model)
+summary(temp_model)
+```
+```{r}
+regression_model <- lm(trip_count ~ avg_temp_c + avg_wind_speed_mph + trip_duration_mins + trip_distance_km, data = data_clean)
+summary(regression_model)
+
+```
+```{r}
+# Dropping Insignificant Predictors:
+simplified_model <- lm(trip_count ~ avg_wind_speed_mph + trip_duration_mins + trip_distance_km, data = data_clean)
+summary(simplified_model)
+
+# Plot Residuals vs. Fitted Values
+plot(regression_model, which = 1)
+
+# QQ Plot
+plot(regression_model, which = 2)
+
+
+```
+```{r}
+# Actual vs Predicted Trip Count:
+ggplot(data_clean, aes(x = trip_count, y = predict(regression_model))) +
+  geom_point(color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Actual vs Predicted Trip Count", x = "Actual Trip Count", y = "Predicted Trip Count")
+
+# Effect of Trip Distance on Trip Count:
+ggplot(data_clean, aes(x = trip_distance_km, y = trip_count)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(title = "Effect of Trip Distance on Trip Count", x = "Trip Distance (km)", y = "Trip Count")
+
+```
+# Model 1
+```{r}
+tripDis_response <- lm(trip_distance_km ~ avg_temp_c + avg_wind_speed_mph + trip_duration_mins, data = data_clean)
+summary(tripDis_response)
+```
+```{r}
+tripDis_response2 <- lm(trip_distance_km ~ avg_temp_c + avg_wind_speed_mph + avg_aerosol_index, data = data_clean)
+summary(tripDis_response2)
+```
+```{r}
+library(randomForest)
+library(caret)
+library(Metrics)
+
+```
+```{r}
+set.seed(123)  # For reproducibility
+
+# Split data into training and testing
+split <- createDataPartition(data_clean$trip_distance_km, p = 0.8, list = FALSE)
+train_data <- data_clean[split, ]
+test_data <- data_clean[-split, ]
+
+
+```
+
+```{r}
+# Train the model
+rf_model <- randomForest(
+  trip_distance_km ~ avg_temp_c + avg_wind_speed_mph + avg_aerosol_index,
+  data = train_data,
+  importance = TRUE,  # Calculate feature importance
+  ntree = 100         # Number of trees
+)
+
+# Print model summary
+print(rf_model)
+
+```
+```{r}
+# Predictions
+predictions <- predict(rf_model, newdata = test_data)
+
+# Calculate RMSE and R²
+rmse_val <- rmse(test_data$trip_distance_km, predictions)
+r2_val <- R2(predictions, test_data$trip_distance_km)
+
+cat("RMSE:", rmse_val, "\n")
+cat("R²:", r2_val, "\n")
+
+```
+```{r}
+# Plot feature importance
+importance(rf_model)
+varImpPlot(rf_model)
+
+```
+
+```{r}
+temp_response <- lm(avg_temp_c ~ avg_wind_speed_mph + avg_aerosol_index, data = data_clean)
+summary(temp_response)
+```
+
