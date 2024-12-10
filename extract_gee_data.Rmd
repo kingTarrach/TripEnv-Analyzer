@@ -1,0 +1,277 @@
+---
+title: "Environmental Data Extraction and Analysis"
+author: "Khairul Islam, Austin Tarrach"
+date: "2024-11-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Project Setup
+```{r}
+# Generative AI was utilized to generate a draft of this code using ChatGPT.
+# Specifically, ChatGPT was used to assist with extracting environmental data from Google Earth Engine.
+# The generated code has been reviewed and adapted to fit the requirements of our needs. 
+```
+
+```{r warning=FALSE}
+# Load libraries
+library(dplyr)
+library(ggplot2)
+library(leaflet)
+library(ggcorrplot)
+library(sf)
+library(caret)
+library(randomForest)
+library(rgee)
+library(lubridate)
+```
+
+
+```{r paged.print=FALSE}
+## Setting up Google Earth Engine (GEE)
+
+# Attempt to authenticate given that the credentials are found, nothing will happen except
+# a return of TRUE. If credentials are not found, it'll ask to authenticate
+# flow and save the credentials. For force reauthentication, include
+# `force=TRUE` in the call. This is generally a one-time setup step.
+ee$Authenticate(auth_mode='notebook')
+
+# Initialize - this will connect to a google cloud project. Used bangla.2343@gmail.com
+ee$Initialize(project='ee-bangla2343')
+
+# verify GEE connections
+ee$String('Connected to GEE server!')$getInfo()
+```
+
+# 2. Data Loading And Inspecting
+```{r}
+# Loading rawlocations.csv
+raw_locations <- read.csv("rawlocations.csv")
+
+# Loading tripData.csv
+trip_data <- read.csv("tripData.csv")
+
+str(raw_locations)
+str(trip_data)
+```
+
+# 3. Preeprocess the raw_locations data for GEE
+```{r}
+# Extract year, month, day and time from datetime and add as a new column
+raw_locations <- raw_locations %>%
+  mutate(
+    datetime = ymd_hms(datetime),  
+    year = year(datetime),        
+    month = month(datetime),     
+    day = day(datetime),        
+    time = format(datetime, "%H:%M:%S") 
+  )
+
+# Convert datetime column to POSIXct and add GEE-compatible format
+raw_locations <- raw_locations %>%
+  mutate(
+    datetime = ymd_hms(datetime, tz = "UTC"), 
+    GEE_datetime = format(datetime, "%Y-%m-%dT%H:%M:%SZ") 
+  )
+
+str(raw_locations)
+```
+# 4. Extract and add environmental data to raw_locations 
+## a. Extracting temperature data  
+```{r}
+# temperature extraction function 
+extract_temperature <- function(latitude, longitude, GEE_datetime) {
+  tryCatch({
+    # Initialize Earth Engine
+    ee_Initialize()
+    
+    point <- ee$Geometry$Point(c(longitude, latitude))
+    
+    # Convert GEE_datetime to POSIXct format and expand the time range
+    datetime <- as.POSIXct(GEE_datetime, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+    start_datetime <- format(datetime - 3600, "%Y-%m-%dT%H:%M:%SZ")  # 1 hour before
+    end_datetime <- format(datetime + 3600, "%Y-%m-%dT%H:%M:%SZ")    # 1 hour after
+    
+    dataset <- ee$ImageCollection("ECMWF/ERA5/HOURLY")$
+      filterBounds(point)$
+      filterDate(start_datetime, end_datetime)
+    
+    dataset_size <- dataset$size()$getInfo()
+    if (dataset_size == 0) {
+      print(sprintf("No data available for Lat: %f, Lon: %f, Time Range: %s to %s",
+                    latitude, longitude, start_datetime, end_datetime))
+      return(NA)
+    }
+    
+    temp_data <- dataset$select("temperature_2m")$
+      mean()$
+      reduceRegion(
+        reducer = ee$Reducer$mean(),
+        geometry = point,
+        scale = 1000
+      )$
+      getInfo()
+    
+    # Convert Kelvin to Celsius
+    temp_celsius <- temp_data$temperature_2m - 273.15
+    return(temp_celsius)
+  }, error = function(e) {
+    print(sprintf("Error for Lat: %f, Lon: %f, Time: %s - %s",
+                  latitude, longitude, GEE_datetime, e$message))
+    return(NA)
+  })
+}
+
+# Apply the temperature extraction function on each row
+raw_locations <- raw_locations %>%
+  rowwise() %>%
+  mutate(
+    temp = extract_temperature(latitude, longitude, GEE_datetime),
+    temp_fahrenheit = (temp * 9 / 5) + 32
+  )
+rename(raw_locations, temp_celsius = temp)
+
+write.csv(raw_locations, "raw_locations_temp.csv", row.names = FALSE)
+```
+
+
+## b. Extracting wind speed data
+```{r}
+# Function to extract wind speed from GEE 
+extract_wind_speed_era5 <- function(latitude, longitude, GEE_datetime) {
+  tryCatch({
+    if (is.na(GEE_datetime) || GEE_datetime == "") {
+      return(NA)
+    }
+
+    point <- ee$Geometry$Point(c(longitude, latitude))
+    datetime <- as.POSIXct(GEE_datetime, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+    start_datetime <- format(datetime - 3600, "%Y-%m-%dT%H:%M:%SZ")
+    end_datetime <- format(datetime + 3600, "%Y-%m-%dT%H:%M:%SZ")
+
+    print(sprintf("Querying Lat: %.6f, Lon: %.6f, Time Range: %s to %s", latitude, longitude, start_datetime, end_datetime))
+
+    dataset <- ee$ImageCollection("ECMWF/ERA5/HOURLY")$
+      filterBounds(point)$
+      filterDate(start_datetime, end_datetime)
+
+    dataset_size <- dataset$size()$getInfo()
+    print(paste("Dataset size:", dataset_size))
+    if (dataset_size == 0) {
+      return(list(m_s = 0.0, mph = 0.0))
+    }
+
+    wind_data <- dataset$select(c("u_component_of_wind_10m", "v_component_of_wind_10m"))$
+      mean()$
+      reduceRegion(
+        reducer = ee$Reducer$mean(),
+        geometry = point,
+        scale = 1000
+      )$
+      getInfo()
+
+    u <- wind_data$u_component_of_wind_10m
+    v <- wind_data$v_component_of_wind_10m
+    wind_speed_m_s <- sqrt(u^2 + v^2)
+    wind_speed_mph <- wind_speed_m_s * 2.23694  # Convert to mph
+
+    return(list(m_s = round(wind_speed_m_s, 6), mph = round(wind_speed_mph, 6)))
+  }, error = function(e) {
+    print(sprintf("Error: %s", e$message))
+    return(list(m_s = NA, mph = NA))
+  })
+}
+
+
+raw_locations_temp <- read.csv("raw_locations_temp.csv")
+
+raw_locations_temp <- raw_locations_temp %>%
+  mutate(
+    GEE_datetime = as.POSIXct(GEE_datetime, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    GEE_datetime = format(GEE_datetime, "%Y-%m-%dT%H:%M:%SZ") 
+  )
+
+raw_locations_temp <- raw_locations_temp %>%
+  rowwise() %>%
+  mutate(
+    wind_speed_result = list(extract_wind_speed_era5(latitude, longitude, GEE_datetime)),
+    wind_speed_ms = wind_speed_result$m_s,  
+    wind_speed_mph = wind_speed_result$mph  
+  ) %>%
+  select(-wind_speed_result) 
+
+write.csv(raw_locations_temp, "raw_locations_env.csv", row.names = FALSE)
+
+```
+
+## c. Extracting air quality (Aerosol Index)  
+```{r}
+# Function to extract air quality (Aerosol Index) from Sentinel-5P
+extract_air_quality_s5p <- function(latitude, longitude, GEE_datetime) {
+  tryCatch({
+  
+    if (is.na(GEE_datetime) || GEE_datetime == "") {
+      return(NA)
+    }
+
+    point <- ee$Geometry$Point(c(longitude, latitude))
+
+    # Expand the time range 
+    datetime <- as.POSIXct(GEE_datetime, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+    start_datetime <- format(datetime - 86400, "%Y-%m-%dT%H:%M:%SZ")  # 1 day before
+    end_datetime <- format(datetime + 86400, "%Y-%m-%dT%H:%M:%SZ")    # 1 day after
+
+    # Debugging logs
+    print(sprintf("Querying Lat: %.6f, Lon: %.6f, Time Range: %s to %s", latitude, longitude, start_datetime, end_datetime))
+
+    dataset <- ee$ImageCollection("COPERNICUS/S5P/OFFL/L3_NO2")$
+      filterBounds(point)$
+      filterDate(start_datetime, end_datetime)
+
+    # Check for data point
+    dataset_size <- dataset$size()$getInfo()
+    print(paste("Dataset size:", dataset_size))
+    if (dataset_size == 0) {
+      return(NA)
+    }
+
+    air_quality_data <- dataset$select("absorbing_aerosol_index")$
+      mean()$
+      reduceRegion(
+        reducer = ee$Reducer$mean(),
+        geometry = point,
+        scale = 7000 
+      )$
+      getInfo()
+
+    aerosol_index <- round(air_quality_data$absorbing_aerosol_index, 6)
+    return(aerosol_index)
+  }, error = function(e) {
+    print(sprintf("Error: %s", e$message))
+    return(NA)
+  })
+}
+
+raw_locations_env <- read.csv("raw_locations_env.csv")
+
+
+# Apply the function on each row
+raw_locations_env <- raw_locations_env %>%
+  rowwise() %>%
+  mutate(
+    air_quality = extract_air_quality_s5p(latitude, longitude, GEE_datetime)
+  )
+
+write.csv(raw_locations_env, "raw_locations_env2.csv", row.names = FALSE)
+
+```
+
+
+
+
+
+
+
